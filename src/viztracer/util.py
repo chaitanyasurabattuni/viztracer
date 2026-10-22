@@ -6,6 +6,7 @@ import datetime
 import errno
 import os
 import re
+import signal
 import sys
 import tempfile
 
@@ -209,9 +210,60 @@ def pid_exists(pid):
             return True
 
 
+def exit_on_sigterm(frame, exiting_funcs: tuple) -> None:
+    """
+    Shared body of VizTracer's SIGTERM handlers: raise SystemExit so the exit
+    routine saves the trace, unless one of exiting_funcs is already running.
+    """
+    from .patch import HookManager
+
+    if frame_stack_has_func(frame, (HookManager._after_fork,)):
+        # CPython ignores exceptions raised in os.register_at_fork callbacks,
+        # so SystemExit would be lost and the process would keep running. A
+        # pool worker that is terminated while it is still starting would then
+        # block forever on the task queue lock, which Pool.terminate() holds.
+        # Nothing has been traced yet, so take SIGTERM's default action.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+        os._exit(128 + signal.SIGTERM)  # pragma: no cover
+    if not frame_stack_has_func(frame, exiting_funcs):
+        sys.exit(0)
+
+
 def frame_stack_has_func(frame, funcs):
     while frame:
         if any(frame.f_code == func.__code__ for func in funcs):
             return True
         frame = frame.f_back
     return False
+
+
+# Code injection (--attach/--uninstall) on Linux relies on a prebuilt attach
+# library for the machine architecture. Only these are shipped with the package.
+LINUX_ATTACH_LIBRARIES = {
+    "x86_64": "attach_linux_amd64.so",
+    "amd64": "attach_linux_amd64.so",
+    "i386": "attach_linux_x86.so",
+    "i686": "attach_linux_x86.so",
+}
+
+
+def attach_library_unavailable_reason() -> str | None:
+    """
+    Return why code injection is unavailable on this Linux machine, or None if
+    the attach library for this architecture is installed.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    import platform
+
+    machine = platform.machine()
+    library = LINUX_ATTACH_LIBRARIES.get(machine.lower())
+    if library is not None and os.path.exists(
+        os.path.join(os.path.dirname(__file__), "attach_process", library)
+    ):
+        return None
+    return (
+        f"VizTracer does not support attaching on Linux {machine}: "
+        f"no attach library is shipped for the {machine} architecture"
+    )

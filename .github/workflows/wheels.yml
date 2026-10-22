@@ -1,115 +1,209 @@
+# Build one sdist, build every wheel from it with cibuildwheel on native
+# runners, test every wheel in fresh environments, then assemble the "dist"
+# artifact: exactly the sdist and the wheels that passed, which release.yml
+# publishes.
+
 name: wheels
 
 on:
   push:
     branches: [ master ]
-    paths:
-      - "src/viztracer/**"
-      - "setup.py"
-      - ".github/workflows/wheels.yml"
   pull_request:
-    paths:
-      - "src/viztracer/**"
-      - "setup.py"
-      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
   workflow_call:
-    inputs:
-      upload_artifacts:
-        required: false
-        type: boolean
-        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Prefixed, because github.workflow is the caller's name when reused
+  group: wheels-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.11.2"
 
 jobs:
-  build-wheels-linux:
-    name: Build wheels on Linux for ${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        manylinux-image: [manylinux2014]
-        arch: [auto, aarch64]
-
+  sdist:
+    name: Build the sdist
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - name: Set up QEMU
-        if: ${{ matrix.arch == 'aarch64' }}
-        uses: docker/setup-qemu-action@v3
         with:
-          image: tonistiigi/binfmt:master
-      - name: Set up Python
-        uses: actions/setup-python@v6
+          persist-credentials: false
+      - uses: actions/setup-python@v6
         with:
-          python-version: 3.11
-      - name: Install dependencies
+          python-version: '3.12'
+      - name: Build the sdist
         run: |
-          python -m pip install --upgrade pip
-          pip install build twine setuptools wheel
-
-      - name: Install cibuildwheel
-        run: python -m pip install cibuildwheel -U
-
-      - name: Build wheels
-        run: python -m cibuildwheel --output-dir wheelhouse
-        env:
-          CIBW_BUILD: cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*
-          CIBW_SKIP: '*musllinux*'
-          CIBW_ARCHS: ${{ matrix.arch }}
-          CIBW_MANYLINUX_*_IMAGE: ${{ matrix.manylinux-image }}
-          CIBW_MANYLINUX_I686_IMAGE: ${{ matrix.manylinux-image }}
-
-      - name: Upload wheels
-        if: ${{ inputs.upload_artifacts || false }}
-        uses: actions/upload-artifact@v4
+          python -m pip install "uv==${UV_VERSION}" -r tools/requirements/tools.txt
+          python -m uv build --sdist --no-config --build-constraint tools/requirements/build-backend.txt --out-dir dist .
+          python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
-          path: wheelhouse/*.whl
-          retention-days: 1
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
-  build-wheels-macos-windows:
+  build-wheels:
     name: Build wheels on ${{ matrix.os }}
+    needs: sdist
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, macos-15-intel, windows-latest, windows-11-arm]
-
+        # Native runners for every architecture, no emulation
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
-      - name: Set up Python
-        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine setuptools wheel
-
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: sdist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Install cibuildwheel
-        run: python -m pip install cibuildwheel -U
-
-      - name: Build wheels
-        if: contains(matrix.os, 'macos')
-        run: python -m cibuildwheel --output-dir wheelhouse
-        env:
-          CIBW_BUILD: cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*
-          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=14
-
-      - name: Build wheels
+        run: python -m pip install -r tools/requirements/tools.txt
+      - name: Pin the build backend
+        run: |
+          constraint="$GITHUB_WORKSPACE/tools/requirements/build-backend.txt"
+          pins=$(grep -E '^[A-Za-z0-9_.-]+==' "$constraint" | cut -d' ' -f1 | tr '\n' ' ')
+          inner=/tmp/viztracer-build-constraints.txt
+          {
+            # Builds on macOS and Windows run on the runner itself
+            printf 'PIP_CONSTRAINT=%s\n' "$constraint"
+            printf 'PIP_BUILD_CONSTRAINT=%s\n' "$constraint"
+            # Linux builds run in manylinux containers
+            printf "CIBW_BEFORE_ALL_LINUX=printf '%%s\\\\n' %s > %s\n" "$pins" "$inner"
+            printf 'CIBW_ENVIRONMENT_LINUX=PIP_CONSTRAINT=%s PIP_BUILD_CONSTRAINT=%s\n' "$inner" "$inner"
+          } >> "$GITHUB_ENV"
+      - name: Limit Windows on Arm to the interpreters it supports
         if: matrix.os == 'windows-11-arm'
-        run: python -m cibuildwheel --output-dir wheelhouse
-        env:
-          CIBW_BUILD: cp312-* cp313-* cp314-* cp314t-*
-
+        run: echo "CIBW_BUILD=cp312-* cp313-* cp314-* cp314t-*" >> "$GITHUB_ENV"
       - name: Build wheels
-        if: "!contains(matrix.os, 'macos') && matrix.os != 'windows-11-arm'"
-        run: python -m cibuildwheel --output-dir wheelhouse
-        env:
-          CIBW_BUILD: cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*
-
-      - name: Upload wheels
-        if: ${{ inputs.upload_artifacts || false }}
-        uses: actions/upload-artifact@v4
+        run: python -m cibuildwheel --output-dir wheelhouse sdist/*.tar.gz
+      - uses: actions/upload-artifact@v4
         with:
-          # Upload all wheels built in wheelhouse/*
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
-          retention-days: 1
+          if-no-files-found: error
+          retention-days: 7
+
+  test-wheels:
+    name: Test wheel (${{ matrix.os }}, ${{ matrix.python-version }})
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must cover every wheel build-wheels produces; the dist job refuses
+        # to assemble a release containing an untested wheel.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.14t']
+        exclude:
+          - python-version: '3.10'
+            os: windows-11-arm
+          - python-version: '3.11'
+            os: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Allow ptrace for the attach tests
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdb
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+      - name: Select the wheel for this interpreter
+        id: wheel
+        run: python tools/check_dist.py select-wheel wheelhouse >> "$GITHUB_OUTPUT"
+      - name: Prepare test environments
+        env:
+          WHEEL: ${{ steps.wheel.outputs.wheel }}
+        run: python tools/test_matrix.py prepare --wheel "$WHEEL" --root "$RUNNER_TEMP/vt"
+      - name: Run the test suite (offline, no installs)
+        run: python tools/test_matrix.py run --root "$RUNNER_TEMP/vt" --results-dir test-results
+      - name: Record the tested wheel
+        env:
+          WHEEL: ${{ steps.wheel.outputs.wheel }}
+        run: python tools/check_dist.py record-tested "$WHEEL" test-results/summary-*.json --out tested
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tested-${{ matrix.os }}-${{ matrix.python-version }}
+          path: tested/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload test logs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-test-results-${{ matrix.os }}-${{ matrix.python-version }}
+          path: test-results/
+          retention-days: 7
+
+  dist:
+    # The single required check for wheels, and the release set for release.yml
+    name: wheels tested
+    if: always()
+    needs: [sdist, build-wheels, test-wheels]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check that every build and test job passed
+        env:
+          SDIST: ${{ needs.sdist.result }}
+          BUILD: ${{ needs.build-wheels.result }}
+          TEST: ${{ needs.test-wheels.result }}
+        run: |
+          echo "sdist=$SDIST build-wheels=$BUILD test-wheels=$TEST"
+          test "$SDIST" = success && test "$BUILD" = success && test "$TEST" = success
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tested-*
+          path: tested
+          merge-multiple: true
+      - name: Verify the release set
+        run: |
+          python -m pip install -r tools/requirements/tools.txt
+          python -m twine check --strict dist/*
+          python tools/check_dist.py verify dist --tested tested
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

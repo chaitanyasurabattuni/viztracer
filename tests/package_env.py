@@ -1,127 +1,66 @@
 # Licensed under the Apache License: http://www.apache.org/licenses/LICENSE-2.0
 # For details: https://github.com/gaogaotiantian/viztracer/blob/master/NOTICE.txt
 
+"""
+Package matrix support for tests whose behavior depends on optional packages.
+
+Tests never install or uninstall packages. A test decorated with
+``package_matrix`` runs once against whatever the current environment provides,
+and is marked with the ``package_matrix`` pytest marker. The release gate
+(tools/test_matrix.py) prepares one environment per combination of the optional
+packages before the test phase and runs the marked tests in each of them.
+"""
+
+import importlib.util
 import inspect
-import os
-import subprocess
-import sys
-from contextlib import contextmanager
-from itertools import product
-from unittest import SkipTest
+
+import pytest
+
+# Optional packages that change viztracer's behavior
+OPTIONAL_PACKAGES = ("orjson", "trio", "torch")
+
+
+def package_available(package: str) -> bool:
+    return importlib.util.find_spec(package) is not None
 
 
 class PackageConfig:
-    def __init__(self, pkg_config):
-        self.pkg_config = pkg_config
+    def __init__(self, packages):
+        self.packages = frozenset(packages)
 
     def has(self, package):
-        for pkg in self.pkg_config:
-            if f"~{package}" in pkg:
-                return False
-            elif package in pkg:
-                return True
-        return False
+        return package in self.packages
+
+    def __repr__(self):
+        return f"PackageConfig({sorted(self.packages)})"
 
 
-def get_curr_packages():
-    freeze_process = subprocess.run(
-        [sys.executable, "-m", "pip", "freeze"], check=True, stdout=subprocess.PIPE
-    )
-    packages = freeze_process.stdout.decode("utf-8").strip().splitlines()
-    return [pkg for pkg in packages if "viztracer" not in pkg]
+def current_package_config(packages=OPTIONAL_PACKAGES) -> PackageConfig:
+    return PackageConfig(pkg for pkg in packages if package_available(pkg))
 
 
-@contextmanager
-def package_keeper():
-    orig_packages = get_curr_packages()
-    try:
-        yield orig_packages
-    finally:
-        curr_packages = get_curr_packages()
-        for pkg in curr_packages:
-            if pkg not in orig_packages:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
-                    stdout=subprocess.DEVNULL,
-                )
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", *orig_packages],
-            stdout=subprocess.DEVNULL,
-        )
-
-
-def setup_env(pkg_matrix, orig_packages):
-    def pkg_key(pkg):
-        # Put the the config that already meets the requirement first
-        for package in orig_packages:
-            if pkg.startswith("~") and pkg[1:] not in package:
-                return 0
-            elif pkg in package:
-                return 0
-        return 1
-
-    if isinstance(pkg_matrix[0], list):
-        pkg_config_iter = product(*pkg_matrix)
-    else:
-        pkg_matrix.sort(key=pkg_key)
-        pkg_config_iter = product(pkg_matrix)
-    for pkg_config in pkg_config_iter:
-        try:
-            for pkg in pkg_config:
-                if pkg.startswith("~"):
-                    subprocess.check_call(
-                        [sys.executable, "-m", "pip", "uninstall", "-y", pkg[1:]],
-                        stdout=subprocess.DEVNULL,
-                    )
-                else:
-                    subprocess.check_call(
-                        [sys.executable, "-m", "pip", "install", pkg],
-                        stdout=subprocess.DEVNULL,
-                    )
-        except subprocess.CalledProcessError:
-            continue
-        yield PackageConfig(pkg_config)
+def _packages_in_matrix(pkg_matrix):
+    names = set()
+    for entry in pkg_matrix:
+        for pkg in entry if isinstance(entry, list) else [entry]:
+            names.add(pkg.lstrip("~"))
+    return sorted(names)
 
 
 def package_matrix(pkg_matrix):
-    def inner_func(func):
-        def wrapper(*args, **kwargs):
-            if os.getenv("GITHUB_ACTIONS"):
-                with package_keeper() as orig_packages:
-                    for _ in setup_env(pkg_matrix, orig_packages):
-                        try:
-                            func(*args, **kwargs)
-                        except SkipTest:
-                            pass
-            else:
-                func(*args, **kwargs)
-
-        return wrapper
-
-    def inner_cls(cls):
-        if os.getenv("GITHUB_ACTIONS"):
-
-            def new_run(self, result=None):
-                with package_keeper() as orig_packages:
-                    for pkg_config in setup_env(pkg_matrix, orig_packages):
-                        self.pkg_config = pkg_config
-                        self._run(result)
-                        self.pkg_config = None
-
-            cls._run = cls.run
-            cls.run = new_run
-        else:
-            cls.pkg_config = PackageConfig(get_curr_packages())
-        return cls
+    """
+    pkg_matrix lists the variants a test supports, e.g. ["~orjson", "orjson"]
+    for "without orjson" and "with orjson". None or [] means the test does not
+    vary with optional packages here.
+    """
 
     def inner(func_or_cls):
         if not pkg_matrix:
             return func_or_cls
-        elif inspect.isfunction(func_or_cls):
-            return inner_func(func_or_cls)
-        elif inspect.isclass(func_or_cls):
-            return inner_cls(func_or_cls)
-        else:
-            assert False
+        packages = _packages_in_matrix(pkg_matrix)
+        marked = pytest.mark.package_matrix(packages=packages)(func_or_cls)
+        if inspect.isclass(marked):
+            marked.pkg_config = current_package_config(packages)
+        return marked
 
     return inner

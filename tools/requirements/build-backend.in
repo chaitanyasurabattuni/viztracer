@@ -1,0 +1,2 @@
+# Build backend used for the sdist and every wheel
+setuptools

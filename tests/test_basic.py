@@ -284,10 +284,7 @@ class TestDecorator(BaseTmpl):
             f()
 
     def test_trace_and_save(self):
-        if os.getenv("GITHUB_ACTIONS"):
-            timeout = 60
-        else:
-            timeout = 20
+        timeout = 20
         with tempfile.TemporaryDirectory() as tmp_dir:
 
             @trace_and_save(output_dir=tmp_dir, verbose=0)

@@ -4,7 +4,7 @@
 import os
 import sys
 
-if os.getenv("GITHUB_ACTIONS") or os.getenv("ENABLE_COREDUMPY"):
+if os.getenv("ENABLE_COREDUMPY"):
     try:
         import coredumpy
 

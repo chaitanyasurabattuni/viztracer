@@ -1,4 +1,10 @@
 [run]
+# Use the C tracer core. coverage's sys.monitoring core (the default on 3.14)
+# holds a non-reentrant lock while it starts/stops measurement, and a Python
+# SIGTERM handler that runs inside that window re-enters the lock and
+# deadlocks. Pool.terminate() sends SIGTERM to workers that are shutting down,
+# so multiprocessing pool tests hung. See RELEASING.md, "Root causes".
+core = ctrace
 cover_pylib = True
 source = viztracer
 patch = subprocess

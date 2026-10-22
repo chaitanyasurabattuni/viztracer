@@ -23,7 +23,7 @@ from . import __version__
 from .patch import install_all_hooks, uninstall_all_hooks
 from .report_builder import ReportBuilder
 from .report_server import ReportServer
-from .util import frame_stack_has_func, unique_path
+from .util import exit_on_sigterm, unique_path
 from .vizevent import VizEvent
 from .vizplugin import VizPluginBase, VizPluginManager
 
@@ -595,10 +595,9 @@ class VizTracer(Tracer):
             # For multiprocessing.pool, it's possible we receive SIGTERM
             # in util._exit_function(), but before tracer.exit_routine()
             # executes. In this case, we can just let the exit finish
-            if not frame_stack_has_func(
+            exit_on_sigterm(
                 frame, (self.exit_routine, multiprocessing.util._exit_function)
-            ):
-                sys.exit(0)
+            )
 
         signal.signal(signal.SIGTERM, term_handler)
 

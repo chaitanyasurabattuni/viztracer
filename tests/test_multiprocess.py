@@ -329,6 +329,40 @@ class TestSubprocess(CmdlineTmpl):
                 check_func=lambda data: self.assertSubprocessName("python -c", data),
             )
 
+    @unittest.skipIf(sys.platform == "win32", "Uses a /bin/sh trampoline")
+    def test_python_entry_sh_trampoline(self):
+        # Installers use this form when the interpreter path is too long for
+        # a shebang line
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entry = os.path.join(tmpdir, "trampoline_entry")
+            with open(entry, "w") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    f"'''exec' '{sys.executable}' \"$0\" \"$@\"\n"
+                    "' '''\n"
+                    "def child():\n"
+                    "    pass\n"
+                    "child()\n"
+                )
+            os.chmod(entry, 0o755)
+            script = f"""
+                import subprocess
+                subprocess.check_output([{entry!r}])
+            """
+
+            def check_func(data):
+                pids = {entry["pid"] for entry in data["traceEvents"]}
+                self.assertEqual(len(pids), 2)
+                self.assertFunctionInEvents(data, "child")
+
+            output_path = os.path.join(tmpdir, "result.json")
+            self.template(
+                ["viztracer", "-o", output_path, "cmdline_test.py"],
+                expected_output_file=output_path,
+                script=script,
+                check_func=check_func,
+            )
+
     def test_python_entries(self):
         script = textwrap.dedent("""
             import subprocess
@@ -643,26 +677,19 @@ class TestMultiprocessing(CmdlineTmpl):
 
     @unittest.skipIf("win32" in sys.platform, "Does not support Windows")
     def test_multiprocessing_pool(self):
-        # I could not reproduce the stuck failure locally. This is only for
-        # coverage anyway, just skip it on 3.8+
         def check_func(data):
             pids = set()
             for entry in data["traceEvents"]:
                 pids.add(entry["pid"])
             self.assertGreater(len(pids), 1)
 
-        try:
-            self.template(
-                ["viztracer", "-o", "result.json", "cmdline_test.py"],
-                expected_output_file="result.json",
-                script=file_pool,
-                check_func=check_func,
-                concurrency="multiprocessing",
-            )
-        except Exception as e:
-            # coveragepy has some issue with multiprocess pool
-            if not os.getenv("COVERAGE_RUN"):
-                raise e
+        self.template(
+            ["viztracer", "-o", "result.json", "cmdline_test.py"],
+            expected_output_file="result.json",
+            script=file_pool,
+            check_func=check_func,
+            concurrency="multiprocessing",
+        )
 
     @unittest.skipIf("win32" in sys.platform, "Does not support Windows")
     def test_multiprocessing_pool_with_pickle(self):

@@ -11,6 +11,7 @@ import http.server
 import io
 import json
 import os
+import signal
 import socket
 import socketserver
 import subprocess
@@ -220,13 +221,22 @@ class DirectoryHandler(HttpHandler):
         return f
 
 
+class ExternalProcessorError(Exception):
+    pass
+
+
 class ExternalProcessorProcess:
     trace_processor_path = os.path.join(
         os.path.dirname(__file__), "web_dist", "trace_processor"
     )
+    # The trace_processor wrapper downloads trace_processor_shell on first use.
+    # Fetching and starting the binary must finish within this many seconds.
+    fetch_timeout = 20
 
     def __init__(self, path: str) -> None:
         self.path = path
+        self._drain_thread: threading.Thread | None = None
+        self._check_available()
         self._process = subprocess.Popen(
             [
                 sys.executable,
@@ -234,25 +244,106 @@ class ExternalProcessorProcess:
                 self.path,
                 "-D",
             ],
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
         atexit.register(self.stop)
-        self._wait_start()
+        try:
+            self._wait_start()
+        except BaseException:
+            self.stop()
+            raise
+
+    def _check_available(self) -> None:
+        # Fetch (if needed) and run the processor with --version first, with a
+        # deadline, so a missing network, curl or binary is reported quickly
+        # instead of waiting on a server that will never come up.
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, self.trace_processor_path, "--version"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=sys.platform != "win32",
+            )
+        except OSError as e:
+            raise ExternalProcessorError(
+                f"failed to run trace processor: {e}"
+            ) from None
+        try:
+            output, _ = proc.communicate(timeout=self.fetch_timeout)
+        except subprocess.TimeoutExpired:
+            # The wrapper may have spawned curl, kill the whole process group
+            if sys.platform != "win32":
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:  # pragma: no cover
+                    pass
+            proc.kill()
+            output, _ = proc.communicate()
+            raise ExternalProcessorError(
+                f"trace processor could not be fetched or started within {self.fetch_timeout}s"
+                + self._format_output(output)
+            ) from None
+        if proc.returncode != 0:
+            raise ExternalProcessorError(
+                f"trace processor could not be fetched or started (exit code {proc.returncode})"
+                + self._format_output(output)
+            )
+
+    @staticmethod
+    def _format_output(output: bytes | str | None) -> str:
+        if not output:
+            return ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        lines = output.strip().splitlines()[-10:]
+        return "\n" + "\n".join(f"    {line}" for line in lines)
 
     def _wait_start(self):
         print("Loading and parsing trace data, this could take a while...")
         assert self._process.stderr is not None
+        output = []
         while True:
-            line = self._process.stderr.readline().decode("utf-8")
+            line = self._process.stderr.readline().decode("utf-8", errors="replace")
+            if not line:
+                # EOF, the processor exited before the server came up
+                self._process.wait()
+                raise ExternalProcessorError(
+                    f"trace processor exited with code {self._process.returncode} before it was ready"
+                    + self._format_output("".join(output))
+                )
+            output.append(line)
             if "This server can be used" in line:
                 break
+        # Keep draining the log so the processor never blocks on a full pipe
+        self._drain_thread = threading.Thread(
+            target=self._drain, args=(self._process.stderr,), daemon=True
+        )
+        self._drain_thread.start()
+
+    @staticmethod
+    def _drain(stream) -> None:
+        try:
+            while stream.read(65536):
+                pass
+        except (OSError, ValueError):
+            pass
 
     def stop(self):
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=2)
-        except subprocess.TimeoutExpired:  # pragma: no cover
-            self._process.kill()
+        if self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=2)
+            except subprocess.TimeoutExpired:  # pragma: no cover
+                self._process.kill()
+                self._process.wait()
+        if self._drain_thread is not None:
+            self._drain_thread.join(timeout=2)
+        if self._process.stderr is not None and (
+            self._drain_thread is None or not self._drain_thread.is_alive()
+        ):
+            self._process.stderr.close()
         atexit.unregister(self.stop)
 
 
@@ -308,7 +399,13 @@ class ServerThread(threading.Thread):
             trace_data = None
             if self.use_external_procesor:
                 Handler = functools.partial(ExternalProcessorHandler, self)
-                self.externel_processor_process = ExternalProcessorProcess(self.path)
+                try:
+                    self.externel_processor_process = ExternalProcessorProcess(
+                        self.path
+                    )
+                except ExternalProcessorError as e:
+                    print(f"Error! Failed to start the external trace processor: {e}")
+                    return 1
             else:
                 if filename.endswith("gz"):
                     with gzip.open(

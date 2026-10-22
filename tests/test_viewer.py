@@ -122,6 +122,15 @@ class Viewer(unittest.TestCase):
     def _wait_until_stdout_ready(self):
         while True:
             line = self.process.stdout.readline()
+            if not line:
+                # EOF, vizviewer exited before it was ready
+                self.process.wait()
+                out = self.process.stdout.read()
+                err = self.process.stderr.read()
+                self.fail(
+                    f"vizviewer exited with {self.process.returncode} before it was ready\n"
+                    f"stdout:\n{out}\nstderr:\n{err}"
+                )
             if "view your trace" in line:
                 break
 
@@ -267,6 +276,111 @@ class TestViewer(CmdlineTmpl):
                 self.assertTrue(resp.code == 200)
         finally:
             os.remove(f.name)
+
+    def _run_external_processor(self, home, path_prefix=None):
+        """
+        Run vizviewer --use_external_processor with an isolated HOME (where the
+        trace_processor wrapper caches its binary) and return the result and
+        the elapsed time.
+        """
+        env = {**os.environ, "HOME": home}
+        if path_prefix is not None:
+            env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
+        cmd = ["vizviewer", "-s", "--use_external_processor"]
+        if os.getenv("COVERAGE_RUN"):
+            cmd = [
+                "coverage",
+                "run",
+                "--source",
+                "viztracer",
+                "--parallel-mode",
+                "-m",
+                "viztracer.viewer",
+                "-s",
+                "--use_external_processor",
+            ]
+        trace = os.path.join(home, "trace.json")
+        with open(trace, "w") as f:
+            f.write('{"file_info": {}, "traceEvents": []}')
+        start = time.monotonic()
+        result = subprocess.run(
+            cmd + [trace],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            timeout=30,
+        )
+        return result, time.monotonic() - start
+
+    def _write_fake_curl(self, bin_dir, script):
+        os.makedirs(bin_dir)
+        curl = os.path.join(bin_dir, "curl")
+        with open(curl, "w") as f:
+            f.write("#!/bin/sh\n" + script + "\n")
+        os.chmod(curl, 0o755)
+
+    def assertProcessorFailedFast(self, result, elapsed):
+        output = result.stdout.decode("utf-8", errors="replace")
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertIn("Failed to start the external trace processor", output)
+        self.assertLess(elapsed, 30)
+
+    @unittest.skipIf(sys.platform == "win32", "Uses a fake curl shell script")
+    def test_external_processor_fetch_fails(self):
+        # No cached processor and the download fails, like an offline machine
+        with tempfile.TemporaryDirectory() as home:
+            bin_dir = os.path.join(home, "bin")
+            self._write_fake_curl(
+                bin_dir, "echo 'curl: (6) Could not resolve host' >&2; exit 6"
+            )
+            result, elapsed = self._run_external_processor(home, bin_dir)
+            self.assertProcessorFailedFast(result, elapsed)
+            self.assertIn("could not be fetched or started", result.stdout.decode())
+
+    @unittest.skipIf(sys.platform == "win32", "Uses a fake curl shell script")
+    def test_external_processor_fetch_hangs(self):
+        # The download never finishes, like a black-holed network
+        with tempfile.TemporaryDirectory() as home:
+            bin_dir = os.path.join(home, "bin")
+            self._write_fake_curl(bin_dir, "exec sleep 600")
+            result, elapsed = self._run_external_processor(home, bin_dir)
+            self.assertProcessorFailedFast(result, elapsed)
+            self.assertIn("within", result.stdout.decode())
+
+    @unittest.skipIf(sys.platform == "win32", "Uses a fake processor shell script")
+    def test_external_processor_cannot_start(self):
+        # A cached processor binary that does not run
+        root_path = os.path.dirname(viztracer.__file__)
+        with open(os.path.join(root_path, "web_dist", "trace_processor")) as f:
+            wrapper = f.read()
+        import platform
+
+        sha256 = None
+        for entry in re.finditer(r"\{(.*?)\}", wrapper, re.DOTALL):
+            body = entry.group(1)
+            plat = re.search(r"'platform':\s*'([^']*)'", body)
+            machines = re.search(r"'machine':\s*\[([^\]]*)\]", body)
+            digest = re.search(r"'sha256':\s*'([0-9a-f]+)'", body)
+            if plat and machines and digest and plat.group(1) == sys.platform:
+                if f"'{platform.machine().lower()}'" in machines.group(1):
+                    sha256 = digest.group(1)
+        if sha256 is None:
+            self.skipTest(
+                f"no trace processor prebuilt for {sys.platform}-{platform.machine()}"
+            )
+        with tempfile.TemporaryDirectory() as home:
+            cache = os.path.join(home, ".local", "share", "perfetto", "prebuilts")
+            os.makedirs(cache)
+            shell = os.path.join(cache, "trace_processor_shell")
+            with open(shell, "w") as f:
+                f.write("#!/bin/sh\necho 'cannot execute binary file' >&2\nexit 126\n")
+            os.chmod(shell, 0o755)
+            with open(shell + ".sha256", "w") as f:
+                f.write(sha256)
+            result, elapsed = self._run_external_processor(home)
+            self.assertProcessorFailedFast(result, elapsed)
+            self.assertIn("cannot execute binary file", result.stdout.decode())
 
     def test_external_processor_version(self):
         root_path = os.path.dirname(viztracer.__file__)

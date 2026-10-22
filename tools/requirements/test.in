@@ -1,0 +1,7 @@
+# Packages the test suite needs in every environment
+pytest
+psutil
+coverage
+loky
+ipywidgets
+objprint

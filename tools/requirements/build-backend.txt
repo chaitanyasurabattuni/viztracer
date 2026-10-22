@@ -1,0 +1,1 @@
+setuptools==84.0.0        # via -r build-backend.in

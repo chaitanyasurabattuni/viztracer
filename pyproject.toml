@@ -43,6 +43,18 @@ vizviewer = "viztracer.viewer:viewer_main"
 [tool.setuptools.dynamic]
 version = {attr = "viztracer.__version__"}
 
+[tool.cibuildwheel]
+# Shared by tools/release_gate.py and .github/workflows/wheels.yml. Wheels are
+# tested by tools/test_matrix.py in fresh environments after they are built.
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+skip = "*-musllinux_*"
+manylinux-x86_64-image = "manylinux2014"
+manylinux-i686-image = "manylinux2014"
+manylinux-aarch64-image = "manylinux2014"
+
+[tool.cibuildwheel.macos]
+environment = { MACOSX_DEPLOYMENT_TARGET = "14" }
+
 [tool.ruff]
 exclude = [
     "src/viztracer/attach_process"

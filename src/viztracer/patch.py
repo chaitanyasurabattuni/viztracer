@@ -112,6 +112,15 @@ def patch_subprocess(viz_args: list[str]) -> None:
                     executable = f.readline().decode("utf-8").strip()
                     if "python" in executable.split("/")[-1]:
                         return True
+                    if executable.split("/")[-1] == "sh":
+                        # Installers write a /bin/sh trampoline when the
+                        # interpreter path is too long for a shebang:
+                        # '''exec' '/long/path/bin/python' "$0" "$@"
+                        match = re.match(
+                            r"'''exec' '([^']+)'", f.readline().decode("utf-8")
+                        )
+                        if match and "python" in match.group(1).split("/")[-1]:
+                            return True
         except Exception:  # pragma: no cover
             pass
         return False

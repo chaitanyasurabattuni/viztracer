@@ -71,12 +71,15 @@ class CmdlineTmpl(BaseTmpl):
             p.stderr.close()
             p.stdout, p.stderr = stdout, stderr
         except subprocess.TimeoutExpired:
-            if os.getenv("GITHUB_ACTIONS") and sys.platform == "linux":
+            if sys.platform == "linux" and shutil.which("pystack"):
+                # Best-effort diagnostics, pystack needs ptrace permission
                 for proc in [p] + psutil.Process(p.pid).children(recursive=True):
                     logging.error(f"Child process {proc.pid} info:")
-                    proc_info = subprocess.check_output(
-                        ["pystack", "remote", str(proc.pid)]
-                    ).decode("utf-8")
+                    proc_info = subprocess.run(
+                        ["pystack", "remote", str(proc.pid)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    ).stdout.decode("utf-8", errors="replace")
                     logging.error(proc_info)
             if sys.platform == "win32":
                 p.terminate()
@@ -163,15 +166,9 @@ class CmdlineTmpl(BaseTmpl):
         if script:
             self.build_script(script, script_name)
         if send_sig is not None:
-            if isinstance(send_sig, tuple):
-                sig, wait = send_sig
-            else:
-                sig = send_sig
-                if os.getenv("GITHUB_ACTIONS"):
-                    # github action is slower
-                    wait = 5
-                else:
-                    wait = 2
+            # send_sig is (signal, wait), wait is a line to wait for on stdout
+            # or a number of seconds
+            sig, wait = send_sig
             result = self.run_cmd(cmd_list, wait=wait, send_signal=sig)
             if sys.platform == "win32":
                 # If we are on win32, we can't get anything useful from

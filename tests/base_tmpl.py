@@ -17,7 +17,9 @@ logging.basicConfig(
 
 
 class BaseTmpl(TestCase):
-    trace_test_time = os.getenv("GITHUB_ACTION") and not os.getenv("COVERAGE_RUN")
+    trace_test_time = os.getenv("VIZTRACER_TRACE_TEST_TIME") and not os.getenv(
+        "COVERAGE_RUN"
+    )
     pkg_config = None
 
     @classmethod

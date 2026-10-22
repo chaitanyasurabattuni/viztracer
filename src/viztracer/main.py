@@ -23,8 +23,9 @@ from . import __version__
 from .code_monkey import CodeMonkey
 from .report_builder import ReportBuilder
 from .util import (
+    attach_library_unavailable_reason,
     color_print,
-    frame_stack_has_func,
+    exit_on_sigterm,
     pid_exists,
     same_line_print,
     time_str_to_us,
@@ -640,15 +641,14 @@ class VizUI:
 
         def term_handler(signalnum, frame):
             # Exit if we are not already doing exit routine
-            if not frame_stack_has_func(
+            exit_on_sigterm(
                 frame,
                 (
                     self.exit_routine,
                     tracer.exit_routine,
                     multiprocessing.util._exit_function,
                 ),
-            ):
-                sys.exit(0)
+            )
 
         signal.signal(signal.SIGTERM, term_handler)
 
@@ -807,12 +807,17 @@ class VizUI:
 
         return True, None
 
-    def _check_attach_availability(self) -> tuple[bool, str | None]:
+    def _check_attach_availability(
+        self, needs_attach_library: bool = True
+    ) -> tuple[bool, str | None]:
         if sys.platform == "win32":
             return False, "VizTracer does not support this feature on Windows"
 
         if sys.platform == "darwin" and "arm" in platform.processor():
             return False, "VizTracer does not support this feature on Apple Silicon"
+
+        if needs_attach_library and (reason := attach_library_unavailable_reason()):
+            return False, reason
 
         if sys.platform == "darwin" and sys.version_info >= (3, 11):
             color_print(
@@ -899,7 +904,8 @@ class VizUI:
         return True, None
 
     def attach_installed(self) -> VizProcedureResult:
-        success, err_msg = self._check_attach_availability()
+        # --attach_installed only sends signals, it does not inject code
+        success, err_msg = self._check_attach_availability(needs_attach_library=False)
 
         if not success:
             return False, err_msg

@@ -18,18 +18,29 @@ from viztracer import VizTracer
 from viztracer.attach_process.add_code_to_python_process import (
     run_python_code,  # type: ignore
 )
-from viztracer.util import pid_exists
+from viztracer.util import attach_library_unavailable_reason, pid_exists
 
 from .cmdline_tmpl import CmdlineTmpl
 from .util import cmd_with_coverage
 
-attach_unavailable = sys.platform == "win32" or (
-    sys.platform == "darwin"
-    and (sys.version_info > (3, 11) or "arm" in platform.processor())
-)
+
+def remote_unavailable_reason():
+    if sys.platform == "win32":
+        return "remote tracing is not supported on Windows"
+    if sys.platform == "darwin" and "arm" in platform.processor():
+        return "remote tracing is not supported on Apple Silicon"
+    if sys.platform == "darwin" and sys.version_info > (3, 11):
+        return "attach does not work on macOS with Python 3.11+ (hardened runtime)"
+    return None
 
 
-@unittest.skipIf(attach_unavailable, "Does not support attach on this platform")
+# Signal based remote control (install, --attach_installed)
+remote_skip_reason = remote_unavailable_reason()
+# Code injection (--attach, --uninstall) also needs the attach library
+attach_skip_reason = remote_skip_reason or attach_library_unavailable_reason()
+
+
+@unittest.skipIf(remote_skip_reason is not None, remote_skip_reason)
 class TestRemote(CmdlineTmpl):
     def test_install(self):
         tracer = VizTracer(output_file="remote.json", verbose=0)
@@ -40,26 +51,31 @@ class TestRemote(CmdlineTmpl):
         self.assertFileExists("remote.json")
         os.remove("remote.json")
 
+    file_installed = textwrap.dedent("""
+        from viztracer import VizTracer
+        import time
+        tracer = VizTracer(output_file='remote.json')
+        tracer.install()
+        print("Ready", flush=True)
+        while True:
+            time.sleep(0.5)
+    """)
+
     def test_attach_installed(self):
-        file_to_attach = textwrap.dedent("""
-            from viztracer import VizTracer
-            import time
-            tracer = VizTracer(output_file='remote.json')
-            tracer.install()
-            print("Ready", flush=True)
-            while True:
-                time.sleep(0.5)
-        """)
         attach_installed_cmd = cmd_with_coverage(["viztracer", "--attach_installed"])
-        attach_cmd = cmd_with_coverage(["viztracer", "-o", "remote.json", "--attach"])
-
-        output_file = "remote.json"
-
-        self.attach_check(file_to_attach, attach_cmd, output_file)
         self.attach_check(
-            file_to_attach, attach_installed_cmd, output_file, use_installed=True
+            self.file_installed,
+            attach_installed_cmd,
+            "remote.json",
+            use_installed=True,
         )
 
+    @unittest.skipIf(attach_skip_reason is not None, attach_skip_reason)
+    def test_attach_to_installed(self):
+        attach_cmd = cmd_with_coverage(["viztracer", "-o", "remote.json", "--attach"])
+        self.attach_check(self.file_installed, attach_cmd, "remote.json")
+
+    @unittest.skipIf(attach_skip_reason is not None, attach_skip_reason)
     def test_attach(self):
         file_to_attach = textwrap.dedent("""
             import time
@@ -174,6 +190,7 @@ class TestRemote(CmdlineTmpl):
         p_attach_invalid.wait()
         self.assertTrue(p_attach_invalid.returncode != 0)
 
+    @unittest.skipIf(attach_skip_reason is not None, attach_skip_reason)
     def test_uninstall(self):
         file_to_attach = textwrap.dedent("""
             import time
@@ -271,8 +288,30 @@ class TestRemoteFail(CmdlineTmpl):
         self.template(["viztracer", "--attach_installed", "1234"], success=False)
         self.template(["viztracer", "--uninstall", "1234"], success=False)
 
+    @unittest.skipUnless(
+        remote_skip_reason is None and attach_library_unavailable_reason(),
+        "Only test platforms without an attach library",
+    )
+    def test_unsupported_architecture(self):
+        machine = platform.machine()
+        # Use a live pid, the architecture check must come first
+        for option in ("--attach", "--uninstall"):
+            start = time.monotonic()
+            result = subprocess.run(
+                cmd_with_coverage(["viztracer", option, str(os.getpid())]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=10,
+            )
+            elapsed = time.monotonic() - start
+            output = result.stdout.decode("utf-8")
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertLess(elapsed, 10)
+            self.assertIn(machine, output)
+            self.assertIn("architecture", output)
 
-@unittest.skipIf(attach_unavailable, "Does not support this platform")
+
+@unittest.skipIf(attach_skip_reason is not None, attach_skip_reason)
 class TestAttachSanity(CmdlineTmpl):
     def test_basic(self):
         file_to_attach = textwrap.dedent("""
@@ -303,7 +342,7 @@ class TestAttachSanity(CmdlineTmpl):
             os.remove("attached_script.py")
 
 
-@unittest.skipIf(attach_unavailable, "Does not support this platform")
+@unittest.skipIf(remote_skip_reason is not None, remote_skip_reason)
 class TestAttachScript(CmdlineTmpl):
     def test_attach_script(self):
         # Isolate the attach stuff in a separate process

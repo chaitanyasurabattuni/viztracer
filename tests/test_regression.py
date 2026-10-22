@@ -546,10 +546,7 @@ def target(conn):
     conn.recv()
     conn.send("ready")
     conn.recv()
-    if os.getenv("GITHUB_ACTIONS"):
-        time.sleep(3)
-    else:
-        time.sleep(1)
+    time.sleep(3)
 
 if __name__ == '__main__':
     parent, child = multiprocessing.Pipe()
@@ -574,10 +571,7 @@ def target(conn):
     conn.recv()
     conn.send("ready")
     conn.recv()
-    if os.getenv("GITHUB_ACTIONS"):
-        time.sleep(3)
-    else:
-        time.sleep(1)
+    time.sleep(3)
     os.kill(os.getpid(), signal.SIGTERM)
 
 if __name__ == '__main__':
